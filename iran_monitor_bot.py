@@ -8,7 +8,7 @@ import html
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 import schedule
@@ -29,10 +29,12 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
 NEWS_QUERY = os.getenv("NEWS_QUERY", "Iran OR Tehran OR IRGC").strip()
 NEWS_PAGE_SIZE = int(os.getenv("NEWS_PAGE_SIZE", "10"))
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
+RUN_ONCE = os.getenv("RUN_ONCE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 # ======================================================
 
 SENT_NEWS_FILE = "sent_news.json"
+UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
 def validate_config():
@@ -159,7 +161,11 @@ def check_and_push():
         t_desc = translate(desc[:400]) if len(desc) > 20 else ""
 
         try:
-            pub = datetime.fromisoformat(a["publishedAt"].replace("Z","+00:00")).strftime("%Y-%m-%d %H:%M UTC")
+            pub = (
+                datetime.fromisoformat(a["publishedAt"].replace("Z", "+00:00"))
+                .astimezone(UTC_PLUS_8)
+                .strftime("%Y-%m-%d %H:%M UTC+8")
+            )
         except:
             pub = a.get("publishedAt", "")
 
@@ -194,6 +200,9 @@ def main():
             print(f"   - {key}")
         return
     if not validate_openrouter_key():
+        return
+    if RUN_ONCE:
+        check_and_push()
         return
 
     send_tg(

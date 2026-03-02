@@ -57,6 +57,59 @@ python3 iran_monitor_bot.py
 
 After startup, the script keeps running and polls on the interval set by `CHECK_INTERVAL_MINUTES`.
 
+## Railway Deployment
+
+This project supports two Railway deployment styles:
+
+1. Railway Cron Job (recommended)
+2. Long-running worker service
+
+### Option 1: Railway Cron Job
+
+This is the better fit for Railway because the process runs once, sends any new items, and exits.
+
+Set this environment variable in Railway:
+
+```env
+RUN_ONCE=true
+```
+
+Use this start command:
+
+```bash
+python3 iran_monitor_bot.py
+```
+
+Then create a Railway Cron schedule and trigger the service on your preferred interval.
+
+### Option 2: Long-Running Worker
+
+If you want to keep the current in-process scheduler, do not set `RUN_ONCE`.
+
+Use this start command:
+
+```bash
+python3 iran_monitor_bot.py
+```
+
+In this mode, the script stays online and checks every `CHECK_INTERVAL_MINUTES`.
+
+### Recommended Railway Variables
+
+Set these in Railway service variables:
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+OPENROUTER_API_KEY=...
+NEWS_API_KEY=...
+CHECK_INTERVAL_MINUTES=10
+NEWS_QUERY=Iran OR Tehran OR IRGC
+NEWS_PAGE_SIZE=10
+OPENROUTER_MODEL=openai/gpt-4o-mini
+RUN_ONCE=true
+```
+
 ## Main Dependencies
 
 - `requests`: calls NewsAPI, OpenRouter API, and Telegram Bot API
