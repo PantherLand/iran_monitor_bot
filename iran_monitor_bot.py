@@ -55,6 +55,19 @@ def validate_openrouter_key():
         return False
     return True
 
+
+def print_runtime_env_status():
+    checks = {
+        "TELEGRAM_BOT_TOKEN": bool(TELEGRAM_BOT_TOKEN),
+        "TELEGRAM_CHAT_ID": bool(TELEGRAM_CHAT_ID),
+        "OPENROUTER_API_KEY": bool(OPENROUTER_API_KEY),
+        "NEWS_API_KEY": bool(NEWS_API_KEY),
+        "RUN_ONCE": RUN_ONCE,
+    }
+    print("Runtime env status:")
+    for key, present in checks.items():
+        print(f"  - {key}: {'set' if present else 'missing'}")
+
 def load_sent_news():
     if os.path.exists(SENT_NEWS_FILE):
         with open(SENT_NEWS_FILE) as f:
@@ -193,6 +206,7 @@ def check_and_push():
 
 def main():
     print("Iran News Monitor Bot started")
+    print_runtime_env_status()
     missing = validate_config()
     if missing:
         print("Missing required configuration. Check your .env file:")
