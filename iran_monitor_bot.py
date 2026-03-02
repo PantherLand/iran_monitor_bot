@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Iran Monitor -> Claude翻译 -> Telegram Bot 推送
+Iran Monitor -> OpenRouter Translation -> Telegram Bot Push
 """
 
 import hashlib
@@ -16,19 +16,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==================== 配置区域（必填）====================
+# ==================== Required Configuration ====================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 
-# ==================== 配置区域（可选）====================
+# ==================== Optional Configuration ====================
 
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
 NEWS_QUERY = os.getenv("NEWS_QUERY", "Iran OR Tehran OR IRGC").strip()
 NEWS_PAGE_SIZE = int(os.getenv("NEWS_PAGE_SIZE", "10"))
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
 
 # ======================================================
 
@@ -39,10 +39,19 @@ def validate_config():
     required = {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
         "NEWS_API_KEY": NEWS_API_KEY,
     }
     return [name for name, value in required.items() if not value]
+
+
+def validate_openrouter_key():
+    # OpenAI project keys start with sk-proj- and will not work with OpenRouter.
+    if OPENROUTER_API_KEY.startswith("sk-proj-"):
+        print("The configured OPENROUTER_API_KEY looks like an OpenAI key (sk-proj-...).")
+        print("Use a real OpenRouter key from https://openrouter.ai/keys instead.")
+        return False
+    return True
 
 def load_sent_news():
     if os.path.exists(SENT_NEWS_FILE):
@@ -66,25 +75,52 @@ def get_iran_news():
         r.raise_for_status()
         return r.json().get("articles", [])
     except Exception as e:
-        print(f"[ERROR] 获取新闻: {e}")
+        print(f"[ERROR] Failed to fetch news: {e}")
         return []
 
 def translate(text):
     if not text:
         return ""
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY,
-                     "anthropic-version": "2023-06-01",
-                     "Content-Type": "application/json"},
-            json={"model": ANTHROPIC_MODEL, "max_tokens": 500,
-                  "messages": [{"role": "user", "content":
-                      f"将以下英文翻译成中文，直接输出翻译，不加解释：\n\n{text}"}]},
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Translate the following English text into Simplified Chinese. "
+                        "Return only the translation with no extra explanation.\n\n"
+                        f"{text}"
+                    ),
+                }
+            ],
+            "max_tokens": 500,
+        }
+        if OPENROUTER_MODEL:
+            payload["model"] = OPENROUTER_MODEL
+
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "X-Title": "Iran News Monitor Bot",
+            },
+            json=payload,
             timeout=30)
         r.raise_for_status()
-        return r.json()["content"][0]["text"].strip()
+        content = r.json()["choices"][0]["message"]["content"]
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            text_parts = [
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ]
+            return "".join(text_parts).strip()
+        return None
     except Exception as e:
-        print(f"[ERROR] 翻译: {e}")
+        print(f"[ERROR] Translation failed: {e}")
         return None
 
 def send_tg(msg):
@@ -97,11 +133,11 @@ def send_tg(msg):
         r.raise_for_status()
         return True
     except Exception as e:
-        print(f"[ERROR] TG发送: {e}")
+        print(f"[ERROR] Telegram send failed: {e}")
         return False
 
 def check_and_push():
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 检查新闻...")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking news...")
     sent = load_sent_news()
     new_count = 0
 
@@ -132,14 +168,14 @@ def check_and_push():
         safe_source = html.escape(a.get("source", {}).get("name", ""))
 
         msg_parts = [
-            "🔴 <b>伊朗实时动态</b>", "",
+            "🔴 <b>Iran Live Update</b>", "",
             f"📌 <b>{safe_title}</b>",
         ]
         if safe_desc:
             msg_parts += ["", f"📝 {safe_desc}"]
-        msg_parts += ["", f"🕐 {pub}", f"📰 {safe_source}"]
+        msg_parts += ["", f"🕐 Published: {pub}", f"📰 Source: {safe_source}"]
         if a.get("url"):
-            msg_parts.append(f"🔗 <a href='{html.escape(a['url'], quote=True)}'>原文</a>")
+            msg_parts.append(f"🔗 <a href='{html.escape(a['url'], quote=True)}'>Original Link</a>")
 
         if send_tg("\n".join(msg_parts)):
             sent.add(h)
@@ -147,18 +183,24 @@ def check_and_push():
             time.sleep(2)
 
     save_sent_news(sent)
-    print(f"  → 推送 {new_count} 条新消息")
+    print(f"  -> Sent {new_count} new message(s)")
 
 def main():
-    print("伊朗新闻监控 Bot 启动")
+    print("Iran News Monitor Bot started")
     missing = validate_config()
     if missing:
-        print("❌ 缺少必要配置，请检查 .env：")
+        print("Missing required configuration. Check your .env file:")
         for key in missing:
             print(f"   - {key}")
         return
+    if not validate_openrouter_key():
+        return
 
-    send_tg(f"🚀 <b>伊朗新闻监控已启动</b>\n每 {CHECK_INTERVAL_MINUTES} 分钟检查一次\n翻译：Claude AI")
+    send_tg(
+        f"🚀 <b>Iran News Monitor is online</b>\n"
+        f"Checking every {CHECK_INTERVAL_MINUTES} minute(s)\n"
+        f"Translation: OpenRouter"
+    )
     check_and_push()
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check_and_push)
 

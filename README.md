@@ -1,24 +1,24 @@
 # Iran News Monitor Bot
 
-一个基于 Python 的伊朗新闻监控脚本：
+A Python script that monitors Iran-related news:
 
-- 定时从 NewsAPI 拉取与伊朗相关的英文新闻
-- 调用 Anthropic API 将标题和摘要翻译为中文
-- 通过 Telegram Bot 推送到指定聊天
-- 使用本地 `sent_news.json` 去重，避免重复发送
+- Fetches Iran-related English news from NewsAPI on a schedule
+- Uses the OpenRouter API to translate titles and summaries into Simplified Chinese
+- Pushes updates to a target chat through a Telegram Bot
+- Uses local `sent_news.json` deduplication to avoid duplicate sends
 
-## 功能说明
+## Features
 
-- 默认每 10 分钟检查一次新闻
-- 默认关键词：`Iran OR Tehran OR IRGC`
-- 默认拉取最近 10 条英文新闻
-- 启动时会先发送一条机器人上线通知，再执行首次检查
+- Checks for news every 10 minutes by default
+- Default query: `Iran OR Tehran OR IRGC`
+- Fetches the latest 10 English articles by default
+- Sends a startup notification before the first check
 
-## 运行环境
+## Requirements
 
 - Python 3.9+
 
-## 安装
+## Installation
 
 ```bash
 python3 -m venv .venv
@@ -26,54 +26,56 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 配置
+## Configuration
 
-1. 复制示例配置：
+1. Copy the example config:
 
 ```bash
 cp .env.example .env
 ```
 
-2. 按实际值填写 `.env`：
+2. Fill in `.env` with your real values:
 
 ```env
-TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token
-TELEGRAM_CHAT_ID=你的 Telegram Chat ID
-ANTHROPIC_API_KEY=你的 Anthropic API Key
-NEWS_API_KEY=你的 NewsAPI Key
+TELEGRAM_BOT_TOKEN=your Telegram Bot Token
+TELEGRAM_CHAT_ID=your Telegram Chat ID
+OPENROUTER_API_KEY=your OpenRouter API Key
+NEWS_API_KEY=your NewsAPI Key
 CHECK_INTERVAL_MINUTES=10
 NEWS_QUERY=Iran OR Tehran OR IRGC
 NEWS_PAGE_SIZE=10
-ANTHROPIC_MODEL=claude-sonnet-4-20250514
+OPENROUTER_MODEL=
 ```
 
-## 启动
+Leave `OPENROUTER_MODEL` empty to use your OpenRouter account default model, or set it to a specific OpenRouter model ID.
+
+## Run
 
 ```bash
 python3 iran_monitor_bot.py
 ```
 
-启动后脚本会持续运行，并按 `CHECK_INTERVAL_MINUTES` 设定的周期轮询。
+After startup, the script keeps running and polls on the interval set by `CHECK_INTERVAL_MINUTES`.
 
-## 主要依赖
+## Main Dependencies
 
-- `requests`：请求 NewsAPI、Anthropic API、Telegram Bot API
-- `schedule`：定时任务调度
-- `python-dotenv`：从 `.env` 加载本地配置
+- `requests`: calls NewsAPI, OpenRouter API, and Telegram Bot API
+- `schedule`: handles periodic job scheduling
+- `python-dotenv`: loads local configuration from `.env`
 
-## 生成文件
+## Generated File
 
-- `sent_news.json`：已推送新闻的哈希缓存，自动生成
+- `sent_news.json`: auto-generated hash cache of already-sent news items
 
-## 注意事项
+## Notes
 
-- `.env` 中包含敏感密钥，不要提交到版本库
-- 如果 Telegram 收到的内容格式异常，通常是上游标题或摘要包含特殊字符，当前脚本已做基础 HTML 转义
-- NewsAPI 免费额度有限，轮询频率不要设置过低
+- `.env` contains sensitive API keys and should not be committed
+- If Telegram formatting looks broken, it is usually caused by special characters in upstream content; the script now applies basic HTML escaping
+- NewsAPI free plans are rate-limited, so avoid setting the polling interval too low
 
-## 后续可扩展
+## Possible Improvements
 
-- 增加更多筛选关键词
-- 增加地区/来源过滤
-- 增加异常重试与日志落盘
-- 改为 systemd、pm2 或 Docker 常驻运行
+- Add more filtering keywords
+- Add source or region filters
+- Add retries and persistent logging
+- Run it as a long-lived service with systemd, pm2, or Docker
