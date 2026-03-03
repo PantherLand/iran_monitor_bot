@@ -5,6 +5,7 @@ A Python script that monitors Iran-related news:
 - Fetches Iran-related English news from NewsAPI on a schedule
 - Uses the OpenRouter API to translate titles and summaries into Simplified Chinese
 - Pushes updates to a target chat through a Telegram Bot
+- Supports a `/summary` Telegram command to generate a same-day news summary
 - Uses local `sent_news.json` deduplication to avoid duplicate sends
 
 ## Features
@@ -13,6 +14,7 @@ A Python script that monitors Iran-related news:
 - Default query: `Iran OR Tehran OR IRGC`
 - Fetches the latest 10 English articles by default
 - Sends a startup notification before the first check
+- Polls Telegram for `/summary` commands and replies with a Chinese daily digest
 
 ## Requirements
 
@@ -82,6 +84,8 @@ python3 iran_monitor_bot.py
 
 Then create a Railway Cron schedule and trigger the service on your preferred interval.
 
+Note: in Cron mode, `/summary` commands are only processed when the next scheduled run starts.
+
 ### Option 2: Long-Running Worker
 
 If you want to keep the current in-process scheduler, do not set `RUN_ONCE`.
@@ -119,6 +123,7 @@ RUN_ONCE=true
 ## Generated File
 
 - `sent_news.json`: auto-generated hash cache of already-sent news items
+- `bot_state.json`: stores the last handled Telegram update ID to avoid reprocessing commands
 
 ## Notes
 
