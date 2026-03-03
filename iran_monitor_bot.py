@@ -143,7 +143,7 @@ def send_tg(msg):
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                  "parse_mode": "HTML", "disable_web_page_preview": False},
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=15)
         r.raise_for_status()
         return True
