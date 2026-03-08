@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Iran Monitor -> OpenRouter Translation -> Telegram Bot Push
+War Reports Monitor -> OpenRouter Summary -> Telegram Push
 """
 
-import hashlib
 import html
 import json
 import os
@@ -25,15 +24,28 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 
 # ==================== Optional Configuration ====================
 
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
-NEWS_QUERY = os.getenv("NEWS_QUERY", "Iran OR Tehran OR IRGC").strip()
-NEWS_PAGE_SIZE = int(os.getenv("NEWS_PAGE_SIZE", "10"))
+SUMMARY_INTERVAL_HOURS = int(os.getenv("SUMMARY_INTERVAL_HOURS", "4"))
+LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "4"))
+NEWS_QUERY = os.getenv(
+    "NEWS_QUERY",
+    "war OR warfare OR military OR missile OR drone OR strike OR conflict OR ceasefire",
+).strip()
+NEWS_PAGE_SIZE = int(os.getenv("NEWS_PAGE_SIZE", "30"))
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
 RUN_ONCE = os.getenv("RUN_ONCE", "").strip().lower() in {"1", "true", "yes", "on"}
 
+DEFAULT_MAINSTREAM_MEDIA_DOMAINS = (
+    "reuters.com,apnews.com,bbc.com,nytimes.com,washingtonpost.com,"
+    "theguardian.com,wsj.com,bloomberg.com,ft.com,aljazeera.com,cnn.com"
+)
+MAINSTREAM_MEDIA_DOMAINS = [
+    x.strip()
+    for x in os.getenv("MAINSTREAM_MEDIA_DOMAINS", DEFAULT_MAINSTREAM_MEDIA_DOMAINS).split(",")
+    if x.strip()
+]
+
 # ======================================================
 
-SENT_NEWS_FILE = "sent_news.json"
 BOT_STATE_FILE = "bot_state.json"
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
@@ -49,7 +61,6 @@ def validate_config():
 
 
 def validate_openrouter_key():
-    # OpenAI project keys start with sk-proj- and will not work with OpenRouter.
     if OPENROUTER_API_KEY.startswith("sk-proj-"):
         print("The configured OPENROUTER_API_KEY looks like an OpenAI key (sk-proj-...).")
         print("Use a real OpenRouter key from https://openrouter.ai/keys instead.")
@@ -63,21 +74,15 @@ def print_runtime_env_status():
         "TELEGRAM_CHAT_ID": bool(TELEGRAM_CHAT_ID),
         "OPENROUTER_API_KEY": bool(OPENROUTER_API_KEY),
         "NEWS_API_KEY": bool(NEWS_API_KEY),
+        "SUMMARY_INTERVAL_HOURS": SUMMARY_INTERVAL_HOURS,
+        "LOOKBACK_HOURS": LOOKBACK_HOURS,
+        "MAINSTREAM_MEDIA_DOMAINS": ",".join(MAINSTREAM_MEDIA_DOMAINS),
         "RUN_ONCE": RUN_ONCE,
     }
     print("Runtime env status:")
     for key, present in checks.items():
         print(f"  - {key}: {'set' if present else 'missing'}")
 
-def load_sent_news():
-    if os.path.exists(SENT_NEWS_FILE):
-        with open(SENT_NEWS_FILE) as f:
-            return set(json.load(f))
-    return set()
-
-def save_sent_news(s):
-    with open(SENT_NEWS_FILE, "w") as f:
-        json.dump(list(s)[-500:], f)
 
 def load_bot_state():
     if os.path.exists(BOT_STATE_FILE):
@@ -87,34 +92,16 @@ def load_bot_state():
                 return data
     return {"last_update_id": 0}
 
+
 def save_bot_state(state):
     with open(BOT_STATE_FILE, "w") as f:
         json.dump(state, f)
 
-def get_iran_news(page_size=None):
-    try:
-        r = requests.get("https://newsapi.org/v2/everything", params={
-            "q": NEWS_QUERY,
-            "sortBy": "publishedAt",
-            "language": "en",
-            "pageSize": page_size or NEWS_PAGE_SIZE,
-            "apiKey": NEWS_API_KEY,
-        }, timeout=15)
-        r.raise_for_status()
-        return r.json().get("articles", [])
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch news: {e}")
-        return []
 
-def call_openrouter(prompt, max_tokens=500):
+def call_openrouter(prompt, max_tokens=900):
     try:
         payload = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
         }
         if OPENROUTER_MODEL:
@@ -125,10 +112,11 @@ def call_openrouter(prompt, max_tokens=500):
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
-                "X-Title": "Iran News Monitor Bot",
+                "X-Title": "War Reports Monitor Bot",
             },
             json=payload,
-            timeout=30)
+            timeout=45,
+        )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
         if isinstance(content, str):
@@ -145,86 +133,160 @@ def call_openrouter(prompt, max_tokens=500):
         print(f"[ERROR] OpenRouter request failed: {e}")
         return None
 
-def translate(text):
-    if not text:
-        return ""
-    return call_openrouter(
-        "Translate the following English text into Simplified Chinese. "
-        "Return only the translation with no extra explanation.\n\n"
-        f"{text}",
-        max_tokens=500,
-    )
+
+def send_tg(msg):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[ERROR] Telegram send failed: {e}")
+        return False
+
 
 def parse_published_at(article):
     published_at = article.get("publishedAt", "")
     if not published_at:
         return None
     try:
-        return (
-            datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-            .astimezone(UTC_PLUS_8)
-        )
+        return datetime.fromisoformat(published_at.replace("Z", "+00:00"))
     except Exception:
         return None
 
-def send_daily_summary():
-    print("  -> Building daily summary...")
-    today = datetime.now(UTC_PLUS_8).date()
-    articles = []
-    for article in get_iran_news(page_size=max(20, NEWS_PAGE_SIZE)):
+
+def fetch_recent_war_reports(hours):
+    now_utc = datetime.now(timezone.utc)
+    since_utc = now_utc - timedelta(hours=hours)
+    params = {
+        "q": NEWS_QUERY,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "pageSize": NEWS_PAGE_SIZE,
+        "from": since_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "apiKey": NEWS_API_KEY,
+    }
+    if MAINSTREAM_MEDIA_DOMAINS:
+        params["domains"] = ",".join(MAINSTREAM_MEDIA_DOMAINS)
+
+    try:
+        r = requests.get("https://newsapi.org/v2/everything", params=params, timeout=20)
+        r.raise_for_status()
+        raw_articles = r.json().get("articles", [])
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch war reports: {e}")
+        return [], since_utc, now_utc
+
+    seen = set()
+    results = []
+    for article in raw_articles:
         title = (article.get("title") or "").strip()
+        url = (article.get("url") or "").strip()
         if not title or title == "[Removed]":
             continue
-        published_at = parse_published_at(article)
-        if published_at and published_at.date() != today:
+        key = url or title
+        if key in seen:
             continue
-        articles.append(article)
-        if len(articles) >= 8:
-            break
+        published = parse_published_at(article)
+        if published and published < since_utc:
+            continue
+        seen.add(key)
+        results.append(article)
+
+    return results, since_utc, now_utc
+
+
+def build_summary_prompt(articles, since_utc, now_utc):
+    lines = [
+        "You are a geopolitical news analyst.",
+        "Create a concise but information-dense summary in Simplified Chinese based only on the reports below.",
+        "Requirements:",
+        "1. First line: one-sentence overview.",
+        "2. Then 4-7 bullet points with concrete details (actors, locations, actions, impacts, timeline).",
+        "3. If there are conflicting claims, explicitly mark uncertainty.",
+        "4. Keep names/transliterations accurate and do not invent facts.",
+        "5. No markdown tables. No HTML.",
+        "",
+        f"Time window UTC: {since_utc.strftime('%Y-%m-%d %H:%M')} -> {now_utc.strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "Reports:",
+    ]
+
+    for idx, article in enumerate(articles[:25], start=1):
+        published = parse_published_at(article)
+        published_text = (
+            published.astimezone(UTC_PLUS_8).strftime("%Y-%m-%d %H:%M UTC+8")
+            if published
+            else article.get("publishedAt", "")
+        )
+        lines.append(f"{idx}. Title: {article.get('title', '')}")
+        lines.append(f"   Description: {article.get('description', '') or ''}")
+        lines.append(f"   Source: {article.get('source', {}).get('name', '')}")
+        lines.append(f"   Published: {published_text}")
+
+    return "\n".join(lines)
+
+
+def send_interval_summary(trigger="schedule"):
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Building {LOOKBACK_HOURS}h summary ({trigger})...")
+    articles, since_utc, now_utc = fetch_recent_war_reports(LOOKBACK_HOURS)
+    since_local = since_utc.astimezone(UTC_PLUS_8)
+    now_local = now_utc.astimezone(UTC_PLUS_8)
 
     if not articles:
         return send_tg(
-            "📰 <b>今日新闻摘要</b>\n\n"
-            "今天还没有抓取到符合条件的新闻。"
+            f"🛰 <b>{LOOKBACK_HOURS}小时战争摘要</b>\n\n"
+            f"🕐 时间范围: {since_local.strftime('%m-%d %H:%M')} - {now_local.strftime('%m-%d %H:%M')} UTC+8\n"
+            "未抓取到主流媒体的相关战争报道。"
         )
 
-    prompt_lines = [
-        "You are a news analyst.",
-        "Based on the Iran-related articles below, write a concise daily summary in Simplified Chinese for Telegram.",
-        "Requirements:",
-        "1. Start with one short overview sentence.",
-        "2. Then provide 3-5 short bullet points using '-' as the bullet marker.",
-        "3. Only use facts supported by the provided articles.",
-        "4. If multiple articles cover the same topic, merge them.",
-        "5. Do not include markdown or HTML.",
-        "",
-        f"Date (UTC+8): {today.isoformat()}",
-        "",
-        "Articles:",
-    ]
-
-    for idx, article in enumerate(articles, start=1):
-        published_at = parse_published_at(article)
-        published_text = (
-            published_at.strftime("%Y-%m-%d %H:%M UTC+8")
-            if published_at else article.get("publishedAt", "")
-        )
-        prompt_lines.append(f"{idx}. Title: {article.get('title', '')}")
-        prompt_lines.append(f"   Description: {article.get('description', '') or ''}")
-        prompt_lines.append(f"   Source: {article.get('source', {}).get('name', '')}")
-        prompt_lines.append(f"   Published: {published_text}")
-
-    summary = call_openrouter("\n".join(prompt_lines), max_tokens=700)
+    prompt = build_summary_prompt(articles, since_utc, now_utc)
+    summary = call_openrouter(prompt, max_tokens=1000)
     if not summary:
         return send_tg(
-            "📰 <b>今日新闻摘要</b>\n\n"
+            f"🛰 <b>{LOOKBACK_HOURS}小时战争摘要</b>\n\n"
             "摘要生成失败，请稍后重试。"
         )
 
-    return send_tg(
-        "📰 <b>今日新闻摘要</b>\n\n"
-        f"{html.escape(summary)}"
-    )
+    sources = sorted({
+        (a.get("source", {}) or {}).get("name", "").strip()
+        for a in articles
+        if (a.get("source", {}) or {}).get("name", "").strip()
+    })
+    msg_parts = [
+        f"🛰 <b>{LOOKBACK_HOURS}小时战争摘要</b>",
+        "",
+        f"🕐 时间范围: {since_local.strftime('%m-%d %H:%M')} - {now_local.strftime('%m-%d %H:%M')} UTC+8",
+        f"📰 报道数: {len(articles)} | 媒体数: {len(sources)}",
+        "",
+        html.escape(summary),
+    ]
+
+    links = []
+    for article in articles[:5]:
+        url = (article.get("url") or "").strip()
+        title = (article.get("title") or "").strip()
+        source = (article.get("source", {}) or {}).get("name", "").strip() or "Unknown"
+        if not url or not title:
+            continue
+        safe_title = html.escape(title[:80])
+        safe_source = html.escape(source)
+        safe_url = html.escape(url, quote=True)
+        links.append(f"• <a href='{safe_url}'>{safe_source}: {safe_title}</a>")
+
+    if links:
+        msg_parts += ["", "🔗 参考报道:", *links]
+
+    return send_tg("\n".join(msg_parts))
+
 
 def get_telegram_updates(offset, timeout=0):
     try:
@@ -246,6 +308,7 @@ def get_telegram_updates(offset, timeout=0):
         print(f"[ERROR] Telegram getUpdates failed: {e}")
         return []
 
+
 def handle_telegram_commands(timeout=0):
     state = load_bot_state()
     updates = get_telegram_updates(state.get("last_update_id", 0), timeout=timeout)
@@ -266,81 +329,15 @@ def handle_telegram_commands(timeout=0):
 
         command = text.split()[0].split("@", 1)[0].lower()
         if command == "/summary":
-            print("  -> Received /summary command")
-            send_tg("🧾 正在生成今日重要新闻摘要，请稍候...")
-            send_daily_summary()
+            send_tg(f"🧾 正在生成过去{LOOKBACK_HOURS}小时战争摘要，请稍候...")
+            send_interval_summary(trigger="command")
 
     state["last_update_id"] = last_update_id
     save_bot_state(state)
 
-def send_tg(msg):
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15)
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"[ERROR] Telegram send failed: {e}")
-        return False
-
-def check_and_push():
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking news...")
-    sent = load_sent_news()
-    new_count = 0
-
-    for a in get_iran_news():
-        h = hashlib.md5((a.get("url") or a.get("title","")).encode()).hexdigest()
-        if h in sent:
-            continue
-
-        title = a.get("title", "")
-        if not title or title == "[Removed]":
-            continue
-
-        print(f"  → {title[:60]}...")
-        t_title = translate(title)
-        if not t_title:
-            continue
-
-        desc = a.get("description", "") or ""
-        t_desc = translate(desc[:400]) if len(desc) > 20 else ""
-
-        try:
-            pub = (
-                datetime.fromisoformat(a["publishedAt"].replace("Z", "+00:00"))
-                .astimezone(UTC_PLUS_8)
-                .strftime("%Y-%m-%d %H:%M UTC+8")
-            )
-        except:
-            pub = a.get("publishedAt", "")
-
-        safe_title = html.escape(t_title)
-        safe_desc = html.escape(t_desc) if t_desc else ""
-        safe_source = html.escape(a.get("source", {}).get("name", ""))
-
-        msg_parts = [
-            "🔴 <b>Iran Live Update</b>", "",
-            f"📌 <b>{safe_title}</b>",
-        ]
-        if safe_desc:
-            msg_parts += ["", f"📝 {safe_desc}"]
-        msg_parts += ["", f"🕐 Published: {pub}", f"📰 Source: {safe_source}"]
-        if a.get("url"):
-            msg_parts.append(f"🔗 <a href='{html.escape(a['url'], quote=True)}'>Original Link</a>")
-
-        if send_tg("\n".join(msg_parts)):
-            sent.add(h)
-            new_count += 1
-            time.sleep(2)
-
-    save_sent_news(sent)
-    print(f"  -> Sent {new_count} new message(s)")
 
 def main():
-    print("Iran News Monitor Bot started")
+    print("War Reports Monitor Bot started")
     print_runtime_env_status()
     missing = validate_config()
     if missing:
@@ -350,24 +347,27 @@ def main():
         return
     if not validate_openrouter_key():
         return
+
     if RUN_ONCE:
         handle_telegram_commands(timeout=0)
-        check_and_push()
+        send_interval_summary(trigger="run_once")
         return
 
     send_tg(
-        f"🚀 <b>Iran News Monitor is online</b>\n"
-        f"Checking every {CHECK_INTERVAL_MINUTES} minute(s)\n"
-        f"Translation: OpenRouter"
+        "🚀 <b>战争报告监控已启动</b>\n"
+        f"每 {SUMMARY_INTERVAL_HOURS} 小时汇总一次\n"
+        f"每次覆盖过去 {LOOKBACK_HOURS} 小时\n"
+        "来源: 主流媒体 (NewsAPI domains)"
     )
     handle_telegram_commands(timeout=0)
-    check_and_push()
-    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check_and_push)
+    send_interval_summary(trigger="startup")
+    schedule.every(SUMMARY_INTERVAL_HOURS).hours.do(send_interval_summary, "schedule")
 
     while True:
         handle_telegram_commands(timeout=5)
         schedule.run_pending()
         time.sleep(1)
+
 
 if __name__ == "__main__":
     main()

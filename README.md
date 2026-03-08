@@ -1,24 +1,22 @@
-# Iran News Monitor Bot
+# War Reports Monitor Bot
 
-A Python script that monitors Iran-related news:
+A Python bot that tracks mainstream-media war reports and sends a Chinese summary to Telegram every 4 hours.
 
-- Fetches Iran-related English news from NewsAPI on a schedule
-- Uses the OpenRouter API to translate titles and summaries into Simplified Chinese
-- Pushes updates to a target chat through a Telegram Bot
-- Supports a `/summary` Telegram command to generate a same-day news summary
-- Uses local `sent_news.json` deduplication to avoid duplicate sends
+## What It Does
 
-## Features
+- Pulls recent war-related reports from NewsAPI (`everything` endpoint)
+- Filters to mainstream media domains
+- Summarizes the past 4-hour window with OpenRouter
+- Sends one digest message to Telegram
+- Supports manual `/summary` command in Telegram
 
-- Checks for news every 10 minutes by default
-- Default query: `Iran OR Tehran OR IRGC`
-- Fetches the latest 10 English articles by default
-- Sends a startup notification before the first check
-- Polls Telegram for `/summary` commands and replies with a Chinese daily digest
+## Default Behavior
 
-## Requirements
-
-- Python 3.9+
+- Execute every 4 hours
+- Each run summarizes the last 4 hours
+- Query keywords focus on war/conflict/military events
+- Preview cards are disabled in Telegram messages
+- Pull interval (`SUMMARY_INTERVAL_HOURS`) and lookback window (`LOOKBACK_HOURS`) are independent
 
 ## Installation
 
@@ -30,26 +28,28 @@ pip install -r requirements.txt
 
 ## Configuration
 
-1. Copy the example config:
+1. Copy env template:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Fill in `.env` with your real values:
+2. Fill `.env`:
 
 ```env
-TELEGRAM_BOT_TOKEN=your Telegram Bot Token
-TELEGRAM_CHAT_ID=your Telegram Chat ID
-OPENROUTER_API_KEY=your OpenRouter API Key
-NEWS_API_KEY=your NewsAPI Key
-CHECK_INTERVAL_MINUTES=10
-NEWS_QUERY=Iran OR Tehran OR IRGC
-NEWS_PAGE_SIZE=10
-OPENROUTER_MODEL=
-```
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+OPENROUTER_API_KEY=...
+NEWS_API_KEY=...
 
-Leave `OPENROUTER_MODEL` empty to use your OpenRouter account default model, or set it to a specific OpenRouter model ID.
+SUMMARY_INTERVAL_HOURS=4
+LOOKBACK_HOURS=4
+NEWS_QUERY=war OR warfare OR military OR missile OR drone OR strike OR conflict OR ceasefire
+MAINSTREAM_MEDIA_DOMAINS=reuters.com,apnews.com,bbc.com,nytimes.com,washingtonpost.com,theguardian.com,wsj.com,bloomberg.com,ft.com,aljazeera.com,cnn.com
+NEWS_PAGE_SIZE=30
+OPENROUTER_MODEL=
+RUN_ONCE=
+```
 
 ## Run
 
@@ -57,83 +57,29 @@ Leave `OPENROUTER_MODEL` empty to use your OpenRouter account default model, or 
 python3 iran_monitor_bot.py
 ```
 
-After startup, the script keeps running and polls on the interval set by `CHECK_INTERVAL_MINUTES`.
+When running as a long-lived process:
 
-## Railway Deployment
+- Bot starts immediately and sends one startup summary
+- Then it sends scheduled summaries every `SUMMARY_INTERVAL_HOURS`
+- Sending `/summary` in the configured chat triggers an on-demand summary
 
-This project supports two Railway deployment styles:
+## Railway / Cron Mode
 
-1. Railway Cron Job (recommended)
-2. Long-running worker service
-
-### Option 1: Railway Cron Job
-
-This is the better fit for Railway because the process runs once, sends any new items, and exits.
-
-Set this environment variable in Railway:
+For cron-style deployment, set:
 
 ```env
 RUN_ONCE=true
 ```
 
-Use this start command:
+In `RUN_ONCE=true`, each run:
 
-```bash
-python3 iran_monitor_bot.py
-```
+- handles pending Telegram commands once
+- generates one summary
+- exits
 
-Then create a Railway Cron schedule and trigger the service on your preferred interval.
+If you want exact every-4-hour execution in cron mode, schedule the job at a 4-hour interval.
+Even if cron is misconfigured (for example every 2 hours), the bot still fetches reports from `now - LOOKBACK_HOURS` (default 4).
 
-Note: in Cron mode, `/summary` commands are only processed when the next scheduled run starts.
+## Generated State File
 
-### Option 2: Long-Running Worker
-
-If you want to keep the current in-process scheduler, do not set `RUN_ONCE`.
-
-Use this start command:
-
-```bash
-python3 iran_monitor_bot.py
-```
-
-In this mode, the script stays online and checks every `CHECK_INTERVAL_MINUTES`.
-
-### Recommended Railway Variables
-
-Set these in Railway service variables:
-
-```env
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-OPENROUTER_API_KEY=...
-NEWS_API_KEY=...
-CHECK_INTERVAL_MINUTES=10
-NEWS_QUERY=Iran OR Tehran OR IRGC
-NEWS_PAGE_SIZE=10
-OPENROUTER_MODEL=openai/gpt-4o-mini
-RUN_ONCE=true
-```
-
-## Main Dependencies
-
-- `requests`: calls NewsAPI, OpenRouter API, and Telegram Bot API
-- `schedule`: handles periodic job scheduling
-- `python-dotenv`: loads local configuration from `.env`
-
-## Generated File
-
-- `sent_news.json`: auto-generated hash cache of already-sent news items
-- `bot_state.json`: stores the last handled Telegram update ID to avoid reprocessing commands
-
-## Notes
-
-- `.env` contains sensitive API keys and should not be committed
-- If Telegram formatting looks broken, it is usually caused by special characters in upstream content; the script now applies basic HTML escaping
-- NewsAPI free plans are rate-limited, so avoid setting the polling interval too low
-
-## Possible Improvements
-
-- Add more filtering keywords
-- Add source or region filters
-- Add retries and persistent logging
-- Run it as a long-lived service with systemd, pm2, or Docker
+- `bot_state.json`: stores last handled Telegram `update_id` to avoid command reprocessing
