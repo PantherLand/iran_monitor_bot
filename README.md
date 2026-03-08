@@ -47,6 +47,7 @@ LOOKBACK_HOURS=4
 NEWS_QUERY=war OR warfare OR military OR missile OR drone OR strike OR conflict OR ceasefire
 MAINSTREAM_MEDIA_DOMAINS=reuters.com,apnews.com,bbc.com,nytimes.com,washingtonpost.com,theguardian.com,wsj.com,bloomberg.com,ft.com,aljazeera.com,cnn.com
 NEWS_PAGE_SIZE=30
+NEWSAPI_RETRY_DEFAULT_SECONDS=1800
 OPENROUTER_MODEL=
 RUN_ONCE=
 ```
@@ -79,6 +80,12 @@ In `RUN_ONCE=true`, each run:
 
 If you want exact every-4-hour execution in cron mode, schedule the job at a 4-hour interval.
 Even if cron is misconfigured (for example every 2 hours), the bot still fetches reports from `now - LOOKBACK_HOURS` (default 4).
+
+## NewsAPI 429 Handling
+
+- If NewsAPI returns HTTP `429`, the bot enters cooldown mode and stops hitting NewsAPI temporarily.
+- Cooldown uses `Retry-After` response header when available; otherwise it falls back to `NEWSAPI_RETRY_DEFAULT_SECONDS` (default `1800` seconds).
+- During cooldown, the bot sends a rate-limit status message instead of a fake "no reports" digest.
 
 ## Generated State File
 

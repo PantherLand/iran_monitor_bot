@@ -26,6 +26,7 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 
 SUMMARY_INTERVAL_HOURS = int(os.getenv("SUMMARY_INTERVAL_HOURS", "4"))
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "4"))
+NEWSAPI_RETRY_DEFAULT_SECONDS = int(os.getenv("NEWSAPI_RETRY_DEFAULT_SECONDS", "1800"))
 NEWS_QUERY = os.getenv(
     "NEWS_QUERY",
     "war OR warfare OR military OR missile OR drone OR strike OR conflict OR ceasefire",
@@ -90,7 +91,7 @@ def load_bot_state():
             data = json.load(f)
             if isinstance(data, dict):
                 return data
-    return {"last_update_id": 0}
+    return {"last_update_id": 0, "newsapi_retry_not_before": 0}
 
 
 def save_bot_state(state):
@@ -181,9 +182,27 @@ def fetch_recent_war_reports(hours):
         r = requests.get("https://newsapi.org/v2/everything", params=params, timeout=20)
         r.raise_for_status()
         raw_articles = r.json().get("articles", [])
+    except requests.HTTPError as e:
+        response = e.response
+        status = response.status_code if response is not None else None
+        retry_after_seconds = None
+        if response is not None:
+            retry_after = (response.headers.get("Retry-After") or "").strip()
+            if retry_after.isdigit():
+                retry_after_seconds = int(retry_after)
+        print(f"[ERROR] Failed to fetch war reports: {e}")
+        return [], since_utc, now_utc, {
+            "status": status,
+            "retry_after_seconds": retry_after_seconds,
+            "message": str(e),
+        }
     except Exception as e:
         print(f"[ERROR] Failed to fetch war reports: {e}")
-        return [], since_utc, now_utc
+        return [], since_utc, now_utc, {
+            "status": None,
+            "retry_after_seconds": None,
+            "message": str(e),
+        }
 
     seen = set()
     results = []
@@ -201,7 +220,7 @@ def fetch_recent_war_reports(hours):
         seen.add(key)
         results.append(article)
 
-    return results, since_utc, now_utc
+    return results, since_utc, now_utc, None
 
 
 def build_summary_prompt(articles, since_utc, now_utc):
@@ -237,9 +256,47 @@ def build_summary_prompt(articles, since_utc, now_utc):
 
 def send_interval_summary(trigger="schedule"):
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Building {LOOKBACK_HOURS}h summary ({trigger})...")
-    articles, since_utc, now_utc = fetch_recent_war_reports(LOOKBACK_HOURS)
+    state = load_bot_state()
+    now_ts = int(time.time())
+    retry_not_before_ts = int(state.get("newsapi_retry_not_before", 0) or 0)
+    if retry_not_before_ts > now_ts:
+        retry_local = datetime.fromtimestamp(retry_not_before_ts, tz=timezone.utc).astimezone(UTC_PLUS_8)
+        print(
+            "[WARN] Skipping NewsAPI request due to active cooldown "
+            f"until {retry_local.strftime('%Y-%m-%d %H:%M:%S UTC+8')}"
+        )
+        return send_tg(
+            "⚠️ <b>News source rate-limited</b>\n\n"
+            f"Next retry after: {retry_local.strftime('%m-%d %H:%M:%S')} UTC+8"
+        )
+
+    articles, since_utc, now_utc, fetch_error = fetch_recent_war_reports(LOOKBACK_HOURS)
     since_local = since_utc.astimezone(UTC_PLUS_8)
     now_local = now_utc.astimezone(UTC_PLUS_8)
+
+    if fetch_error:
+        if fetch_error.get("status") == 429:
+            retry_after_seconds = fetch_error.get("retry_after_seconds") or NEWSAPI_RETRY_DEFAULT_SECONDS
+            retry_not_before = int(time.time()) + retry_after_seconds
+            state["newsapi_retry_not_before"] = retry_not_before
+            save_bot_state(state)
+            retry_local = datetime.fromtimestamp(retry_not_before, tz=timezone.utc).astimezone(UTC_PLUS_8)
+            print(
+                "[WARN] NewsAPI rate-limited. "
+                f"Cooling down for {retry_after_seconds}s until {retry_local.strftime('%Y-%m-%d %H:%M:%S UTC+8')}"
+            )
+            return send_tg(
+                "⚠️ <b>NewsAPI quota/rate limit reached</b>\n\n"
+                f"Next retry after: {retry_local.strftime('%m-%d %H:%M:%S')} UTC+8"
+            )
+        return send_tg(
+            "⚠️ <b>Failed to fetch reports</b>\n\n"
+            "News source request failed. Will retry in the next cycle."
+        )
+
+    if state.get("newsapi_retry_not_before"):
+        state["newsapi_retry_not_before"] = 0
+        save_bot_state(state)
 
     if not articles:
         return send_tg(
