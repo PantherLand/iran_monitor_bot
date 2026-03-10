@@ -8,6 +8,9 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 
 import requests
 import schedule
@@ -24,9 +27,11 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 
 # ==================== Optional Configuration ====================
 
+NEWS_PROVIDER = os.getenv("NEWS_PROVIDER", "auto").strip().lower()
 SUMMARY_INTERVAL_HOURS = int(os.getenv("SUMMARY_INTERVAL_HOURS", "4"))
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "4"))
 NEWSAPI_RETRY_DEFAULT_SECONDS = int(os.getenv("NEWSAPI_RETRY_DEFAULT_SECONDS", "1800"))
+GDELT_RETRY_DEFAULT_SECONDS = int(os.getenv("GDELT_RETRY_DEFAULT_SECONDS", "15"))
 NEWS_QUERY = os.getenv(
     "NEWS_QUERY",
     "war OR warfare OR military OR missile OR drone OR strike OR conflict OR ceasefire",
@@ -56,8 +61,9 @@ def validate_config():
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
         "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
-        "NEWS_API_KEY": NEWS_API_KEY,
     }
+    if NEWS_PROVIDER == "newsapi":
+        required["NEWS_API_KEY"] = NEWS_API_KEY
     return [name for name, value in required.items() if not value]
 
 
@@ -74,6 +80,7 @@ def print_runtime_env_status():
         "TELEGRAM_BOT_TOKEN": bool(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID": bool(TELEGRAM_CHAT_ID),
         "OPENROUTER_API_KEY": bool(OPENROUTER_API_KEY),
+        "NEWS_PROVIDER": NEWS_PROVIDER,
         "NEWS_API_KEY": bool(NEWS_API_KEY),
         "SUMMARY_INTERVAL_HOURS": SUMMARY_INTERVAL_HOURS,
         "LOOKBACK_HOURS": LOOKBACK_HOURS,
@@ -81,8 +88,12 @@ def print_runtime_env_status():
         "RUN_ONCE": RUN_ONCE,
     }
     print("Runtime env status:")
-    for key, present in checks.items():
-        print(f"  - {key}: {'set' if present else 'missing'}")
+    for key, value in checks.items():
+        if isinstance(value, bool):
+            rendered = "set" if value else "missing"
+        else:
+            rendered = str(value)
+        print(f"  - {key}: {rendered}")
 
 
 def load_bot_state():
@@ -90,8 +101,10 @@ def load_bot_state():
         with open(BOT_STATE_FILE) as f:
             data = json.load(f)
             if isinstance(data, dict):
+                if "source_retry_not_before" not in data and "newsapi_retry_not_before" in data:
+                    data["source_retry_not_before"] = data.get("newsapi_retry_not_before", 0)
                 return data
-    return {"last_update_id": 0, "newsapi_retry_not_before": 0}
+    return {"last_update_id": 0, "source_retry_not_before": 0}
 
 
 def save_bot_state(state):
@@ -164,7 +177,87 @@ def parse_published_at(article):
         return None
 
 
-def fetch_recent_war_reports(hours):
+def build_gdelt_query():
+    query = f"({NEWS_QUERY})"
+    if MAINSTREAM_MEDIA_DOMAINS:
+        domain_terms = " OR ".join(f"domainis:{domain}" for domain in MAINSTREAM_MEDIA_DOMAINS)
+        query = f"{query} ({domain_terms})"
+    return query
+
+
+def build_google_news_rss_query(hours):
+    return f"{NEWS_QUERY} when:{hours}h"
+
+
+def extract_domain(url):
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    domain = (parsed.netloc or "").lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def is_allowed_domain(domain):
+    if not MAINSTREAM_MEDIA_DOMAINS:
+        return True
+    return domain in {item.lower() for item in MAINSTREAM_MEDIA_DOMAINS}
+
+
+def normalize_gdelt_article(article):
+    published_at = ""
+    seen_date = (article.get("seendate") or "").strip()
+    if seen_date:
+        try:
+            published_at = datetime.strptime(seen_date, "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc
+            ).isoformat()
+        except ValueError:
+            published_at = seen_date
+
+    domain = (article.get("domain") or "").strip()
+    return {
+        "title": (article.get("title") or "").strip(),
+        "description": "",
+        "url": (article.get("url") or "").strip(),
+        "publishedAt": published_at,
+        "source": {"name": domain or "GDELT"},
+    }
+
+
+def normalize_google_news_rss_item(item):
+    title = (item.findtext("title") or "").strip()
+    link = (item.findtext("link") or "").strip()
+    pub_date = (item.findtext("pubDate") or "").strip()
+    published_at = ""
+    if pub_date:
+        try:
+            published_at = parsedate_to_datetime(pub_date).astimezone(timezone.utc).isoformat()
+        except Exception:
+            published_at = pub_date
+
+    source_node = item.find("source")
+    source_name = ""
+    source_url = ""
+    if source_node is not None:
+        source_name = (source_node.text or "").strip()
+        source_url = (source_node.attrib.get("url") or "").strip()
+
+    if source_name and title.endswith(f" - {source_name}"):
+        title = title[: -(len(source_name) + 3)].strip()
+
+    return {
+        "title": title,
+        "description": "",
+        "url": link,
+        "publishedAt": published_at,
+        "source": {"name": source_name or extract_domain(source_url) or "Google News"},
+        "_source_url": source_url,
+    }
+
+
+def fetch_recent_war_reports_newsapi(hours):
     now_utc = datetime.now(timezone.utc)
     since_utc = now_utc - timedelta(hours=hours)
     params = {
@@ -223,6 +316,152 @@ def fetch_recent_war_reports(hours):
     return results, since_utc, now_utc, None
 
 
+def fetch_recent_war_reports_google_news_rss(hours):
+    now_utc = datetime.now(timezone.utc)
+    since_utc = now_utc - timedelta(hours=hours)
+    params = {
+        "q": build_google_news_rss_query(hours),
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    }
+
+    try:
+        r = requests.get("https://news.google.com/rss/search", params=params, timeout=20)
+        r.raise_for_status()
+        root = ET.fromstring(r.text)
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch war reports: {e}")
+        return [], since_utc, now_utc, {
+            "status": None,
+            "retry_after_seconds": None,
+            "message": str(e),
+        }
+
+    seen = set()
+    results = []
+    for item in root.findall("./channel/item"):
+        article = normalize_google_news_rss_item(item)
+        title = (article.get("title") or "").strip()
+        url = (article.get("url") or "").strip()
+        if not title or title == "[Removed]":
+            continue
+        source_url = article.pop("_source_url", "")
+        domain = extract_domain(source_url) or extract_domain(url)
+        if domain and not is_allowed_domain(domain):
+            continue
+        key = url or title
+        if key in seen:
+            continue
+        published = parse_published_at(article)
+        if published and published < since_utc:
+            continue
+        seen.add(key)
+        results.append(article)
+        if len(results) >= NEWS_PAGE_SIZE:
+            break
+
+    return results, since_utc, now_utc, None
+
+
+def fetch_recent_war_reports_gdelt(hours):
+    now_utc = datetime.now(timezone.utc)
+    since_utc = now_utc - timedelta(hours=hours)
+    params = {
+        "query": build_gdelt_query(),
+        "mode": "artlist",
+        "format": "json",
+        "maxrecords": NEWS_PAGE_SIZE,
+        "timespan": f"{hours}h",
+        "sort": "datedesc",
+    }
+
+    try:
+        r = requests.get("https://api.gdeltproject.org/api/v2/doc/doc", params=params, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+        raw_articles = payload.get("articles", [])
+    except requests.HTTPError as e:
+        print(f"[ERROR] Failed to fetch war reports: {e}")
+        return [], since_utc, now_utc, {
+            "status": e.response.status_code if e.response is not None else None,
+            "retry_after_seconds": GDELT_RETRY_DEFAULT_SECONDS,
+            "message": str(e),
+        }
+    except json.JSONDecodeError:
+        response_text = (r.text or "").strip()
+        print(f"[ERROR] Failed to fetch war reports: {response_text}")
+        status = 429 if "Please limit requests" in response_text else None
+        retry_after_seconds = GDELT_RETRY_DEFAULT_SECONDS if status == 429 else None
+        return [], since_utc, now_utc, {
+            "status": status,
+            "retry_after_seconds": retry_after_seconds,
+            "message": response_text,
+        }
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch war reports: {e}")
+        return [], since_utc, now_utc, {
+            "status": None,
+            "retry_after_seconds": None,
+            "message": str(e),
+        }
+
+    seen = set()
+    results = []
+    for raw_article in raw_articles:
+        article = normalize_gdelt_article(raw_article)
+        title = (article.get("title") or "").strip()
+        url = (article.get("url") or "").strip()
+        if not title or title == "[Removed]":
+            continue
+        key = url or title
+        if key in seen:
+            continue
+        published = parse_published_at(article)
+        if published and published < since_utc:
+            continue
+        seen.add(key)
+        results.append(article)
+
+    return results, since_utc, now_utc, None
+
+
+def fetch_recent_war_reports(hours):
+    if NEWS_PROVIDER == "auto":
+        providers = ["google_news_rss", "gdelt"]
+        if NEWS_API_KEY:
+            providers.append("newsapi")
+        last_error = None
+        for provider in providers:
+            if provider == "google_news_rss":
+                articles, since_utc, now_utc, fetch_error = fetch_recent_war_reports_google_news_rss(hours)
+            elif provider == "gdelt":
+                articles, since_utc, now_utc, fetch_error = fetch_recent_war_reports_gdelt(hours)
+            else:
+                articles, since_utc, now_utc, fetch_error = fetch_recent_war_reports_newsapi(hours)
+
+            if articles:
+                return articles, since_utc, now_utc, None
+            if fetch_error:
+                fetch_error["provider"] = provider
+                last_error = fetch_error
+        return [], since_utc, now_utc, last_error
+
+    if NEWS_PROVIDER == "google_news_rss":
+        return fetch_recent_war_reports_google_news_rss(hours)
+    if NEWS_PROVIDER == "newsapi":
+        return fetch_recent_war_reports_newsapi(hours)
+    if NEWS_PROVIDER == "gdelt":
+        return fetch_recent_war_reports_gdelt(hours)
+    now_utc = datetime.now(timezone.utc)
+    since_utc = now_utc - timedelta(hours=hours)
+    return [], since_utc, now_utc, {
+        "status": None,
+        "retry_after_seconds": None,
+        "message": f"Unsupported NEWS_PROVIDER: {NEWS_PROVIDER}",
+    }
+
+
 def build_summary_prompt(articles, since_utc, now_utc):
     lines = [
         "You are a geopolitical news analyst.",
@@ -258,15 +497,17 @@ def send_interval_summary(trigger="schedule"):
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Building {LOOKBACK_HOURS}h summary ({trigger})...")
     state = load_bot_state()
     now_ts = int(time.time())
-    retry_not_before_ts = int(state.get("newsapi_retry_not_before", 0) or 0)
-    if retry_not_before_ts > now_ts:
+    retry_not_before_ts = int(
+        state.get("source_retry_not_before", state.get("newsapi_retry_not_before", 0)) or 0
+    )
+    if NEWS_PROVIDER != "auto" and retry_not_before_ts > now_ts:
         retry_local = datetime.fromtimestamp(retry_not_before_ts, tz=timezone.utc).astimezone(UTC_PLUS_8)
         print(
-            "[WARN] Skipping NewsAPI request due to active cooldown "
+            f"[WARN] Skipping {NEWS_PROVIDER} request due to active cooldown "
             f"until {retry_local.strftime('%Y-%m-%d %H:%M:%S UTC+8')}"
         )
         return send_tg(
-            "⚠️ <b>News source rate-limited</b>\n\n"
+            f"⚠️ <b>{html.escape(NEWS_PROVIDER.upper())} is rate-limited</b>\n\n"
             f"Next retry after: {retry_local.strftime('%m-%d %H:%M:%S')} UTC+8"
         )
 
@@ -275,26 +516,32 @@ def send_interval_summary(trigger="schedule"):
     now_local = now_utc.astimezone(UTC_PLUS_8)
 
     if fetch_error:
+        failed_provider = fetch_error.get("provider", NEWS_PROVIDER)
         if fetch_error.get("status") == 429:
-            retry_after_seconds = fetch_error.get("retry_after_seconds") or NEWSAPI_RETRY_DEFAULT_SECONDS
-            retry_not_before = int(time.time()) + retry_after_seconds
-            state["newsapi_retry_not_before"] = retry_not_before
-            save_bot_state(state)
-            retry_local = datetime.fromtimestamp(retry_not_before, tz=timezone.utc).astimezone(UTC_PLUS_8)
-            print(
-                "[WARN] NewsAPI rate-limited. "
-                f"Cooling down for {retry_after_seconds}s until {retry_local.strftime('%Y-%m-%d %H:%M:%S UTC+8')}"
+            retry_after_seconds = fetch_error.get("retry_after_seconds") or (
+                NEWSAPI_RETRY_DEFAULT_SECONDS if failed_provider == "newsapi" else GDELT_RETRY_DEFAULT_SECONDS
             )
-            return send_tg(
-                "⚠️ <b>NewsAPI quota/rate limit reached</b>\n\n"
-                f"Next retry after: {retry_local.strftime('%m-%d %H:%M:%S')} UTC+8"
-            )
+            if NEWS_PROVIDER != "auto":
+                retry_not_before = int(time.time()) + retry_after_seconds
+                state["source_retry_not_before"] = retry_not_before
+                save_bot_state(state)
+                retry_local = datetime.fromtimestamp(retry_not_before, tz=timezone.utc).astimezone(UTC_PLUS_8)
+                print(
+                    f"[WARN] {failed_provider.upper()} rate-limited. "
+                    f"Cooling down for {retry_after_seconds}s until {retry_local.strftime('%Y-%m-%d %H:%M:%S UTC+8')}"
+                )
+                return send_tg(
+                    f"⚠️ <b>{html.escape(failed_provider.upper())} quota/rate limit reached</b>\n\n"
+                    f"Next retry after: {retry_local.strftime('%m-%d %H:%M:%S')} UTC+8"
+                )
+            print(f"[WARN] Fallback source {failed_provider} rate-limited in auto mode.")
         return send_tg(
             "⚠️ <b>Failed to fetch reports</b>\n\n"
-            "News source request failed. Will retry in the next cycle."
+            f"News source request failed for {html.escape(failed_provider)}. Will retry in the next cycle."
         )
 
-    if state.get("newsapi_retry_not_before"):
+    if state.get("source_retry_not_before") or state.get("newsapi_retry_not_before"):
+        state["source_retry_not_before"] = 0
         state["newsapi_retry_not_before"] = 0
         save_bot_state(state)
 
